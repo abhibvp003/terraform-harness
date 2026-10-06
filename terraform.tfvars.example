@@ -1,0 +1,40 @@
+###############################################################################
+# Copy to terraform.tfvars and fill in, or use the ready-made files in envs/.
+#
+# terraform.tfvars is gitignored on purpose - it tends to collect account ids
+# and internal CIDRs.
+###############################################################################
+
+project     = "platform"
+environment = "dev"
+region      = "us-east-1"
+
+allowed_account_ids = ["111122223333"]
+
+vpc_cidr = "10.20.0.0/16"
+az_count = 3
+
+kubernetes_version = "1.31"
+
+cluster_endpoint_public_access = false
+cluster_api_allowed_cidrs      = ["10.0.0.0/8"]
+
+cluster_admin_principal_arns = [
+  "arn:aws:iam::111122223333:role/platform-engineers",
+]
+
+coredns_replica_count = 1
+
+node_groups = {
+  general = {
+    instance_types = ["t3.medium"]
+    desired_size   = 1
+    min_size       = 1
+    max_size       = 2
+  }
+}
+
+tags = {
+  CostCenter = "REPLACE"
+  Owner      = "REPLACE"
+}

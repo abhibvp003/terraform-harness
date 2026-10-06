@@ -1,0 +1,597 @@
+###############################################################################
+# Harness CI pipeline for the EKS Terraform project.
+#
+# Flow:
+#   1. plan      - install pinned tooling, init, validate, plan
+#   2. approval  - manual gate, only for destroy or for the prod environment
+#   3. execute   - re-init, then apply or destroy
+#
+# Plan and execute are separate stages so a human can read the plan before
+# anything is created or deleted. Harness Cloud does not share a workspace
+# between stages, so execute re-runs init. That costs about 30 seconds and is
+# worth it to put a gate in front of billable infrastructure.
+#
+# -----------------------------------------------------------------------------
+# Two implementation details worth knowing before you edit this
+#
+# 1. shell is Sh, so the scripts use `set -eu` and not `set -euo pipefail`.
+#    pipefail is a bashism. Under dash the `set -o pipefail` line fails, and
+#    combined with `set -e` that kills the step before it does anything.
+#
+# 2. Each Run step is its own container. Only /harness (the workspace volume)
+#    survives between steps in a stage. Anything written to /usr/local/bin in
+#    one step is gone in the next. That is why Terraform is installed into
+#    TF_BIN_DIR below and every step puts it back on PATH.
+# -----------------------------------------------------------------------------
+#
+# Required Harness secrets (project or org scope):
+#   aws_access_key_id
+#   aws_secret_access_key
+#
+# Prefer an AWS OIDC connector over static keys if your account allows it.
+# These two secrets are long-lived credentials, the weakest available option.
+###############################################################################
+
+pipeline:
+  name: terraform-eks-pipeline
+  identifier: terraform_eks_pipeline
+  projectIdentifier: HarnessCICDZerotoHero
+  orgIdentifier: default
+  tags: {}
+
+  properties:
+    ci:
+      codebase:
+        connectorRef: account.Github
+        repoName: abhibvp003/Harness-CI-CD-Zero-to-Hero
+        build: <+input>
+
+  variables:
+    - name: tf_action
+      type: String
+      description: "apply creates or updates the cluster. destroy deletes everything."
+      value: <+input>.allowedValues(apply,destroy)
+
+    - name: tf_env
+      type: String
+      description: "Which envs/<name>.tfvars to use. dev is the low-cost learning profile."
+      value: <+input>.allowedValues(dev,prod).default(dev)
+
+    - name: tf_working_dir
+      type: String
+      description: "Path to the Terraform root inside the repo. Use . if it sits at the top."
+      value: <+input>.default(Episode-03/terraform-project)
+
+    - name: tf_version
+      type: String
+      description: "Pinned Terraform version. Never latest - an unplanned upgrade can rewrite state."
+      value: <+input>.default(1.9.8)
+
+    - name: aws_region
+      type: String
+      description: "Region to deploy into. Must match the region in the tfvars file."
+      value: <+input>.default(us-east-1)
+
+    - name: state_bucket
+      type: String
+      description: "S3 bucket holding Terraform state. Must already exist, versioned and encrypted."
+      value: <+input>.default(terraform-statefile-028872334692)
+
+    - name: state_key_prefix
+      type: String
+      description: "Key prefix in the bucket. The env name is appended so dev and prod never share state."
+      value: <+input>.default(harness-demo/eks)
+
+    - name: state_lock_table
+      type: String
+      description: "DynamoDB table for state locking. Set to none to skip (unsafe if two runs overlap)."
+      value: <+input>.default(none)
+
+    - name: cluster_admin_role_arn
+      type: String
+      description: "IAM role granted cluster-admin via an EKS access entry. none means use the tfvars value."
+      value: <+input>.default(none)
+
+  stages:
+    # =========================================================================
+    # 1. PLAN
+    # =========================================================================
+    - stage:
+        name: plan
+        identifier: plan
+        description: Install pinned tooling, init the S3 backend, validate and plan
+        type: CI
+        tags: {}
+        spec:
+          cloneCodebase: true
+          caching:
+            enabled: false
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Setup Tools
+                  identifier: setup_tools
+                  timeout: 10m
+                  spec:
+                    shell: Sh
+                    envVariables:
+                      AWS_ACCESS_KEY_ID: <+secrets.getValue("aws_access_key_id")>
+                      AWS_SECRET_ACCESS_KEY: <+secrets.getValue("aws_secret_access_key")>
+                      AWS_DEFAULT_REGION: <+pipeline.variables.aws_region>
+                      TF_BIN_DIR: /harness/.tfbin
+                      TF_VERSION: <+pipeline.variables.tf_version>
+                    command: |-
+                      set -eu
+
+                      echo "=== Pinning Terraform to ${TF_VERSION} ==="
+
+                      # Installed into the workspace, not /usr/local/bin, because
+                      # every step runs in a fresh container and only /harness
+                      # persists between them.
+                      mkdir -p "${TF_BIN_DIR}"
+                      export PATH="${TF_BIN_DIR}:${PATH}"
+
+                      HAVE=""
+                      if command -v terraform >/dev/null 2>&1; then
+                        HAVE="$(terraform version -json 2>/dev/null \
+                          | sed -n 's/.*"terraform_version": *"\([^"]*\)".*/\1/p')" || HAVE=""
+                      fi
+
+                      if [ "${HAVE}" = "${TF_VERSION}" ]; then
+                        echo "Terraform ${TF_VERSION} already available."
+                      else
+                        echo "Have '${HAVE:-none}', want '${TF_VERSION}'. Downloading."
+
+                        command -v curl >/dev/null 2>&1 || { echo "curl not found in image"; exit 1; }
+                        command -v unzip >/dev/null 2>&1 || { echo "unzip not found in image"; exit 1; }
+
+                        curl -fsSL -o /tmp/tf.zip \
+                          "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip"
+                        unzip -o -q /tmp/tf.zip -d "${TF_BIN_DIR}"
+                        chmod 0755 "${TF_BIN_DIR}/terraform"
+                        rm -f /tmp/tf.zip
+                      fi
+
+                      echo "=== Versions ==="
+                      terraform version
+                      aws --version
+
+                      echo "=== Identity ==="
+                      # Account and ARN only. Never echo the key material.
+                      aws sts get-caller-identity
+
+                      echo ""
+                      echo "Use this ARN as cluster_admin_role_arn so kubectl works:"
+                      aws sts get-caller-identity --query Arn --output text
+
+                      echo "=== Setup done ==="
+
+              - step:
+                  type: Run
+                  name: Terraform Init
+                  identifier: tf_init
+                  timeout: 15m
+                  spec:
+                    shell: Sh
+                    envVariables:
+                      AWS_ACCESS_KEY_ID: <+secrets.getValue("aws_access_key_id")>
+                      AWS_SECRET_ACCESS_KEY: <+secrets.getValue("aws_secret_access_key")>
+                      AWS_DEFAULT_REGION: <+pipeline.variables.aws_region>
+                      TF_BIN_DIR: /harness/.tfbin
+                      TF_WORKING_DIR: <+pipeline.variables.tf_working_dir>
+                      TF_ENV: <+pipeline.variables.tf_env>
+                      STATE_BUCKET: <+pipeline.variables.state_bucket>
+                      STATE_KEY_PREFIX: <+pipeline.variables.state_key_prefix>
+                      STATE_LOCK_TABLE: <+pipeline.variables.state_lock_table>
+                      STATE_REGION: <+pipeline.variables.aws_region>
+                    command: |-
+                      set -eu
+                      export PATH="${TF_BIN_DIR}:${PATH}"
+                      cd "${TF_WORKING_DIR}"
+
+                      echo "=== Terraform Init ==="
+                      echo "env:    ${TF_ENV}"
+                      echo "bucket: ${STATE_BUCKET}"
+                      echo "key:    ${STATE_KEY_PREFIX}/${TF_ENV}/terraform.tfstate"
+
+                      # backend.tf declares a partial S3 backend on purpose, so
+                      # bucket, key and region arrive here instead of being
+                      # hardcoded in a tracked file.
+                      #
+                      # The env name is in the key so dev and prod can never
+                      # overwrite each other's state.
+                      set -- \
+                        -backend-config="bucket=${STATE_BUCKET}" \
+                        -backend-config="key=${STATE_KEY_PREFIX}/${TF_ENV}/terraform.tfstate" \
+                        -backend-config="region=${STATE_REGION}" \
+                        -backend-config="encrypt=true"
+
+                      if [ "${STATE_LOCK_TABLE}" != "none" ] && [ -n "${STATE_LOCK_TABLE}" ]; then
+                        echo "lock:   ${STATE_LOCK_TABLE}"
+                        set -- "$@" -backend-config="dynamodb_table=${STATE_LOCK_TABLE}"
+                      else
+                        echo "lock:   NONE - two overlapping runs can corrupt state"
+                      fi
+
+                      terraform init -input=false -no-color "$@"
+
+                      echo "=== Init done ==="
+
+              - step:
+                  type: Run
+                  name: Terraform Validate
+                  identifier: tf_validate
+                  timeout: 10m
+                  spec:
+                    shell: Sh
+                    envVariables:
+                      AWS_ACCESS_KEY_ID: <+secrets.getValue("aws_access_key_id")>
+                      AWS_SECRET_ACCESS_KEY: <+secrets.getValue("aws_secret_access_key")>
+                      AWS_DEFAULT_REGION: <+pipeline.variables.aws_region>
+                      TF_BIN_DIR: /harness/.tfbin
+                      TF_WORKING_DIR: <+pipeline.variables.tf_working_dir>
+                    command: |-
+                      set -eu
+                      export PATH="${TF_BIN_DIR}:${PATH}"
+                      cd "${TF_WORKING_DIR}"
+
+                      echo "=== Formatting ==="
+                      # -check fails the build instead of rewriting files, so the
+                      # committed diff stays the author's.
+                      if ! terraform fmt -recursive -check -no-color; then
+                        echo ""
+                        echo "The files listed above are not formatted."
+                        echo "Run 'terraform fmt -recursive' locally and commit."
+                        exit 1
+                      fi
+                      echo "Formatting clean."
+
+                      echo "=== Validate ==="
+                      terraform validate -no-color
+
+                      echo "=== Validate done ==="
+
+              - step:
+                  type: Run
+                  name: Terraform Plan
+                  identifier: tf_plan
+                  timeout: 20m
+                  spec:
+                    shell: Sh
+                    envVariables:
+                      AWS_ACCESS_KEY_ID: <+secrets.getValue("aws_access_key_id")>
+                      AWS_SECRET_ACCESS_KEY: <+secrets.getValue("aws_secret_access_key")>
+                      AWS_DEFAULT_REGION: <+pipeline.variables.aws_region>
+                      TF_BIN_DIR: /harness/.tfbin
+                      TF_WORKING_DIR: <+pipeline.variables.tf_working_dir>
+                      TF_ENV: <+pipeline.variables.tf_env>
+                      TF_ACTION: <+pipeline.variables.tf_action>
+                      ADMIN_ARN: <+pipeline.variables.cluster_admin_role_arn>
+                    command: |-
+                      set -eu
+                      export PATH="${TF_BIN_DIR}:${PATH}"
+                      cd "${TF_WORKING_DIR}"
+
+                      VARFILE="envs/${TF_ENV}.tfvars"
+                      if [ ! -f "${VARFILE}" ]; then
+                        echo "No such var file: ${VARFILE}"
+                        echo "Available:"
+                        ls -1 envs/
+                        exit 1
+                      fi
+
+                      set -- -input=false -no-color -var-file="${VARFILE}"
+
+                      # The cluster is created with
+                      # bootstrap_cluster_creator_admin_permissions = false, so
+                      # without an admin principal it builds fine but nobody can
+                      # run kubectl against it.
+                      if [ "${ADMIN_ARN}" != "none" ] && [ -n "${ADMIN_ARN}" ]; then
+                        echo "cluster admin: ${ADMIN_ARN}"
+                        set -- "$@" -var="cluster_admin_principal_arns=[\"${ADMIN_ARN}\"]"
+                      else
+                        echo "cluster admin: taking the value from ${VARFILE}"
+                      fi
+
+                      echo "=== Terraform Plan (action: ${TF_ACTION}, env: ${TF_ENV}) ==="
+
+                      if [ "${TF_ACTION}" = "destroy" ]; then
+                        terraform plan -destroy "$@"
+                      else
+                        terraform plan "$@"
+                      fi
+
+                      echo ""
+                      echo "========================================="
+                      echo "  Read the plan above before approving."
+                      echo "  action: ${TF_ACTION}"
+                      echo "  env:    ${TF_ENV}"
+                      echo "========================================="
+
+    # =========================================================================
+    # 2. APPROVAL
+    #
+    # Fires only for a destroy, or for anything aimed at prod. A dev apply goes
+    # straight through, since that is the normal learning loop.
+    # =========================================================================
+    - stage:
+        name: approval
+        identifier: approval
+        description: Manual gate for destroy and for prod
+        type: Approval
+        tags: {}
+        spec:
+          execution:
+            steps:
+              - step:
+                  type: HarnessApproval
+                  name: Confirm Action
+                  identifier: confirm_action
+                  timeout: 1d
+                  spec:
+                    approvalMessage: |-
+                      Confirm this Terraform run.
+
+                      action: <+pipeline.variables.tf_action>
+                      env:    <+pipeline.variables.tf_env>
+                      region: <+pipeline.variables.aws_region>
+
+                      A destroy cannot be undone. Check the plan output in the
+                      previous stage before approving.
+                    includePipelineExecutionHistory: true
+                    isAutoRejectEnabled: false
+                    approvers:
+                      userGroups:
+                        - account._account_all_users
+                      minimumCount: 1
+                      disallowPipelineExecutor: false
+                    approverInputs: []
+        when:
+          pipelineStatus: Success
+          condition: <+pipeline.variables.tf_action> == "destroy" || <+pipeline.variables.tf_env> == "prod"
+
+    # =========================================================================
+    # 3. EXECUTE
+    # =========================================================================
+    - stage:
+        name: execute
+        identifier: execute
+        description: Apply or destroy the infrastructure
+        type: CI
+        tags: {}
+        spec:
+          cloneCodebase: true
+          caching:
+            enabled: false
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Setup Tools
+                  identifier: setup_tools_exec
+                  timeout: 10m
+                  spec:
+                    shell: Sh
+                    envVariables:
+                      AWS_ACCESS_KEY_ID: <+secrets.getValue("aws_access_key_id")>
+                      AWS_SECRET_ACCESS_KEY: <+secrets.getValue("aws_secret_access_key")>
+                      AWS_DEFAULT_REGION: <+pipeline.variables.aws_region>
+                      TF_BIN_DIR: /harness/.tfbin
+                      TF_VERSION: <+pipeline.variables.tf_version>
+                    command: |-
+                      set -eu
+
+                      mkdir -p "${TF_BIN_DIR}"
+                      export PATH="${TF_BIN_DIR}:${PATH}"
+
+                      HAVE=""
+                      if command -v terraform >/dev/null 2>&1; then
+                        HAVE="$(terraform version -json 2>/dev/null \
+                          | sed -n 's/.*"terraform_version": *"\([^"]*\)".*/\1/p')" || HAVE=""
+                      fi
+
+                      if [ "${HAVE}" != "${TF_VERSION}" ]; then
+                        curl -fsSL -o /tmp/tf.zip \
+                          "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip"
+                        unzip -o -q /tmp/tf.zip -d "${TF_BIN_DIR}"
+                        chmod 0755 "${TF_BIN_DIR}/terraform"
+                        rm -f /tmp/tf.zip
+                      fi
+
+                      terraform version
+                      aws sts get-caller-identity
+
+              - step:
+                  type: Run
+                  name: Terraform Init
+                  identifier: tf_init_exec
+                  timeout: 15m
+                  spec:
+                    shell: Sh
+                    envVariables:
+                      AWS_ACCESS_KEY_ID: <+secrets.getValue("aws_access_key_id")>
+                      AWS_SECRET_ACCESS_KEY: <+secrets.getValue("aws_secret_access_key")>
+                      AWS_DEFAULT_REGION: <+pipeline.variables.aws_region>
+                      TF_BIN_DIR: /harness/.tfbin
+                      TF_WORKING_DIR: <+pipeline.variables.tf_working_dir>
+                      TF_ENV: <+pipeline.variables.tf_env>
+                      STATE_BUCKET: <+pipeline.variables.state_bucket>
+                      STATE_KEY_PREFIX: <+pipeline.variables.state_key_prefix>
+                      STATE_LOCK_TABLE: <+pipeline.variables.state_lock_table>
+                      STATE_REGION: <+pipeline.variables.aws_region>
+                    command: |-
+                      set -eu
+                      export PATH="${TF_BIN_DIR}:${PATH}"
+                      cd "${TF_WORKING_DIR}"
+
+                      set -- \
+                        -backend-config="bucket=${STATE_BUCKET}" \
+                        -backend-config="key=${STATE_KEY_PREFIX}/${TF_ENV}/terraform.tfstate" \
+                        -backend-config="region=${STATE_REGION}" \
+                        -backend-config="encrypt=true"
+
+                      if [ "${STATE_LOCK_TABLE}" != "none" ] && [ -n "${STATE_LOCK_TABLE}" ]; then
+                        set -- "$@" -backend-config="dynamodb_table=${STATE_LOCK_TABLE}"
+                      fi
+
+                      terraform init -input=false -no-color "$@"
+
+              - step:
+                  type: Run
+                  name: Pre Destroy Check
+                  identifier: pre_destroy_check
+                  timeout: 15m
+                  spec:
+                    shell: Sh
+                    envVariables:
+                      AWS_ACCESS_KEY_ID: <+secrets.getValue("aws_access_key_id")>
+                      AWS_SECRET_ACCESS_KEY: <+secrets.getValue("aws_secret_access_key")>
+                      AWS_DEFAULT_REGION: <+pipeline.variables.aws_region>
+                      TF_BIN_DIR: /harness/.tfbin
+                      TF_WORKING_DIR: <+pipeline.variables.tf_working_dir>
+                    command: |-
+                      set -eu
+                      export PATH="${TF_BIN_DIR}:${PATH}"
+                      cd "${TF_WORKING_DIR}"
+
+                      echo "=== Looking for AWS resources Kubernetes created ==="
+
+                      # Load balancers from Service type=LoadBalancer or Ingress
+                      # are created by Kubernetes, not Terraform. Terraform does
+                      # not know to delete them, their ENIs stay in the subnets,
+                      # and the subnet or VPC delete then hangs until it times
+                      # out. This is the single most common reason an EKS
+                      # destroy appears to freeze.
+                      CLUSTER="$(terraform output -raw cluster_name 2>/dev/null)" || CLUSTER=""
+
+                      if [ -z "${CLUSTER}" ]; then
+                        echo "Nothing in state. Nothing to check."
+                        exit 0
+                      fi
+
+                      VPC="$(terraform output -raw vpc_id 2>/dev/null)" || VPC=""
+                      echo "cluster: ${CLUSTER}"
+                      echo "vpc:     ${VPC:-unknown}"
+
+                      FOUND=0
+
+                      if [ -n "${VPC}" ]; then
+                        echo ""
+                        echo "--- Load balancers in ${VPC} ---"
+
+                        LBS="$(aws elbv2 describe-load-balancers \
+                          --query "LoadBalancers[?VpcId=='${VPC}'].LoadBalancerArn" \
+                          --output text 2>/dev/null)" || LBS=""
+                        CLBS="$(aws elb describe-load-balancers \
+                          --query "LoadBalancerDescriptions[?VPCId=='${VPC}'].LoadBalancerName" \
+                          --output text 2>/dev/null)" || CLBS=""
+
+                        if [ -n "${LBS}" ] || [ -n "${CLBS}" ]; then
+                          [ -n "${LBS}" ] && echo "${LBS}"
+                          [ -n "${CLBS}" ] && echo "${CLBS}"
+                          FOUND=1
+                        else
+                          echo "none"
+                        fi
+                      fi
+
+                      if [ "${FOUND}" -eq 1 ]; then
+                        echo ""
+                        echo "========================================="
+                        echo "  WARNING"
+                        echo ""
+                        echo "  The load balancers above were created by"
+                        echo "  Kubernetes, not Terraform. The destroy will"
+                        echo "  probably stall on the subnet or VPC delete."
+                        echo ""
+                        echo "  Clear them from inside the cluster first:"
+                        echo "    kubectl delete svc --all --all-namespaces"
+                        echo "    kubectl delete ingress --all --all-namespaces"
+                        echo ""
+                        echo "  Continuing anyway."
+                        echo "========================================="
+                      else
+                        echo ""
+                        echo "Clean. Safe to destroy."
+                      fi
+                  when:
+                    stageStatus: Success
+                    condition: <+pipeline.variables.tf_action> == "destroy"
+
+              - step:
+                  type: Run
+                  name: Terraform Execute
+                  identifier: tf_execute
+                  timeout: 60m
+                  spec:
+                    shell: Sh
+                    envVariables:
+                      AWS_ACCESS_KEY_ID: <+secrets.getValue("aws_access_key_id")>
+                      AWS_SECRET_ACCESS_KEY: <+secrets.getValue("aws_secret_access_key")>
+                      AWS_DEFAULT_REGION: <+pipeline.variables.aws_region>
+                      TF_BIN_DIR: /harness/.tfbin
+                      TF_WORKING_DIR: <+pipeline.variables.tf_working_dir>
+                      TF_ENV: <+pipeline.variables.tf_env>
+                      TF_ACTION: <+pipeline.variables.tf_action>
+                      ADMIN_ARN: <+pipeline.variables.cluster_admin_role_arn>
+                    command: |-
+                      set -eu
+                      export PATH="${TF_BIN_DIR}:${PATH}"
+                      cd "${TF_WORKING_DIR}"
+
+                      VARFILE="envs/${TF_ENV}.tfvars"
+
+                      set -- -input=false -no-color -auto-approve -var-file="${VARFILE}"
+
+                      if [ "${ADMIN_ARN}" != "none" ] && [ -n "${ADMIN_ARN}" ]; then
+                        set -- "$@" -var="cluster_admin_principal_arns=[\"${ADMIN_ARN}\"]"
+                      fi
+
+                      echo "=== Terraform ${TF_ACTION} (env: ${TF_ENV}) ==="
+
+                      if [ "${TF_ACTION}" = "destroy" ]; then
+                        terraform destroy "$@"
+                        echo ""
+                        echo "========================================="
+                        echo "  DESTROYED. All resources deleted."
+                        echo "  Ongoing cost for this stack: 0 USD"
+                        echo "========================================="
+                      else
+                        terraform apply "$@"
+                        echo ""
+                        echo "========================================="
+                        echo "  CREATED"
+                        echo "========================================="
+                        terraform output
+
+                        CLUSTER="$(terraform output -raw cluster_name 2>/dev/null)" || CLUSTER=""
+
+                        echo ""
+                        echo "========================================="
+                        if [ -n "${CLUSTER}" ]; then
+                          echo "  Point kubectl at it:"
+                          echo "    aws eks update-kubeconfig --region ${AWS_DEFAULT_REGION} --name ${CLUSTER}"
+                          echo ""
+                          echo "  The API endpoint is private by default, so"
+                          echo "  this has to run from inside the VPC."
+                          echo ""
+                        fi
+                        echo "  Running cost is roughly 0.15 USD/hour,"
+                        echo "  about 109 USD/month, and the EKS control"
+                        echo "  plane is most of it. Re-run this pipeline"
+                        echo "  with tf_action=destroy when you finish."
+                        echo "========================================="
+                      fi

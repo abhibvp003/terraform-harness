@@ -1,0 +1,39 @@
+
+Changes to Outputs:
+  + node_placement = {
+      + egress_path = "vpc endpoints only"
+      + nat_gateway = false
+      + public_ip   = false
+      + subnets     = "private"
+    }
+  + region         = "us-east-1"
+
+You can apply this plan to save these new output values to the Terraform
+state, without changing any real infrastructure.
+
+Error: Resource precondition failed
+
+  on main.tf line 199, in resource "terraform_data" "preflight":
+ 199:       condition = (
+ 200:         var.enable_nat_gateway
+ 201:         || var.place_nodes_in_public_subnets
+ 202:         || var.enable_vpc_endpoints
+ 203:       )
+    ├────────────────
+    │ var.enable_nat_gateway is false
+    │ var.enable_vpc_endpoints is false
+    │ var.place_nodes_in_public_subnets is false
+
+Nodes would have no route to ECR and would never join the cluster.
+
+Pick one:
+  enable_nat_gateway            = true   (~33 USD/month)
+  place_nodes_in_public_subnets = true   (~3.60 USD/month per node)
+  enable_vpc_endpoints          = true   (billed per endpoint per AZ)
+
+Error: Retrieving AWS account details: validating provider credentials: retrieving caller identity from STS: operation error STS: GetCallerIdentity, https response error StatusCode: 403, RequestID: 17c7cff7-5f01-4957-90ed-e4f65923df11, api error InvalidClientTokenId: The security token included in the request is invalid.
+
+  with provider["registry.terraform.io/hashicorp/aws"],
+  on providers.tf line 1, in provider "aws":
+   1: provider "aws" {
+

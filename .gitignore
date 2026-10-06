@@ -1,0 +1,37 @@
+# Kiro AI workspace files - do not push to remote
+.kiro/
+
+# Terraform
+.terraform/
+.terraform.lock.hcl.bak
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+*.tfplan
+*.tfplan.*
+tfplan.*
+
+# Local backend config, if you choose to use a file instead of env vars
+backend.hcl
+
+# Never commit real variable values - they carry account ids / CIDRs
+terraform.tfvars
+*.auto.tfvars
+!*.tfvars.example
+
+# Local kubeconfig output
+kubeconfig
+kubeconfig-*
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
