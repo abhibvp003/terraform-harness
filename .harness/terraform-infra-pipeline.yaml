@@ -21,8 +21,8 @@ pipeline:
       value: <+input>.allowedValues(dev,prod).default(dev)
     - name: tf_working_dir
       type: String
-      description: Path to the Terraform root inside the repo. Use . if it sits at the top.
-      value: <+input>.default(terraform-harness)
+      description: Path to the Terraform root inside the repo, relative to the clone root. Use . when main.tf is at the top level.
+      value: <+input>.default(.)
     - name: tf_version
       type: String
       description: Pinned Terraform version. Never latest - an unplanned upgrade can rewrite state.
@@ -126,6 +126,85 @@ pipeline:
                       echo "=== Setup done ==="
               - step:
                   type: Run
+                  name: Inspect Workspace
+                  identifier: inspect_workspace
+                  timeout: 10m
+                  spec:
+                    shell: Sh
+                    envVariables:
+                      TF_WORKING_DIR: <+pipeline.variables.tf_working_dir>
+                      TF_ENV: <+pipeline.variables.tf_env>
+                    command: |-
+                      set -eu
+
+                      # Cheap insurance. Almost every "file not found" failure in
+                      # this pipeline is either the wrong tf_working_dir or a
+                      # file that never made it into the repo, and both are
+                      # obvious from the listing below.
+
+                      echo "=== Clone root ==="
+                      echo "pwd: $(pwd)"
+                      ls -la
+
+                      WORK="${TF_WORKING_DIR:-.}"
+                      [ -n "${WORK}" ] || WORK="."
+
+                      echo ""
+                      echo "=== tf_working_dir: '${WORK}' ==="
+                      if [ ! -d "${WORK}" ]; then
+                        echo "MISSING. Set tf_working_dir to one of the directories above."
+                        echo "If main.tf is at the clone root, use '.'"
+                        exit 1
+                      fi
+                      ls -la "${WORK}"
+
+                      echo ""
+                      echo "=== Terraform roots found (main.tf) ==="
+                      find . -maxdepth 4 -name main.tf -not -path "*/.terraform/*" 2>/dev/null \
+                        | sed 's#/main.tf$##' | sed 's#^$#.#' || echo "none"
+
+                      echo ""
+                      echo "=== .tfvars files found anywhere in the clone ==="
+                      TFVARS="$(find . -maxdepth 4 -name '*.tfvars' -not -path "*/.terraform/*" 2>/dev/null)" || TFVARS=""
+                      if [ -n "${TFVARS}" ]; then
+                        echo "${TFVARS}"
+                      else
+                        echo "NONE FOUND"
+                      fi
+
+                      echo ""
+                      echo "=== Expected var file ==="
+                      WANT="${WORK}/envs/${TF_ENV}.tfvars"
+                      if [ -f "${WANT}" ]; then
+                        echo "OK: ${WANT}"
+                      else
+                        echo "MISSING: ${WANT}"
+                        echo ""
+                        echo "-----------------------------------------------------------"
+                        echo "If .tfvars files are listed as NONE FOUND above but they"
+                        echo "exist on your machine, they were never pushed. The usual"
+                        echo "reason is a .gitignore that excludes them."
+                        echo ""
+                        echo "GitHub's stock Terraform .gitignore template contains:"
+                        echo "    *.tfvars"
+                        echo "    *.tfvars.json"
+                        echo ""
+                        echo "which silently drops envs/${TF_ENV}.tfvars. Check locally:"
+                        echo "    git check-ignore -v envs/${TF_ENV}.tfvars"
+                        echo ""
+                        echo "If it reports a match, allow the envs directory back in"
+                        echo "by adding this to .gitignore AFTER the *.tfvars line:"
+                        echo "    !envs/*.tfvars"
+                        echo "then:"
+                        echo "    git add -f envs/${TF_ENV}.tfvars && git commit && git push"
+                        echo "-----------------------------------------------------------"
+                        exit 1
+                      fi
+
+                      echo ""
+                      echo "=== Inspect done ==="
+              - step:
+                  type: Run
                   name: Terraform Init
                   identifier: tf_init
                   timeout: 15m
@@ -145,7 +224,19 @@ pipeline:
                     command: |-
                       set -eu
                       export PATH="${TF_BIN_DIR}:${PATH}"
-                      cd "${TF_WORKING_DIR}"
+
+                      # An empty tf_working_dir would make `cd ""` a silent
+                      # no-op, so the failure would surface later as a
+                      # confusing "file not found". Resolve and check it here.
+                      WORK="${TF_WORKING_DIR:-.}"
+                      [ -n "${WORK}" ] || WORK="."
+                      if [ ! -d "${WORK}" ]; then
+                        echo "tf_working_dir '${WORK}' does not exist in the clone."
+                        echo "Contents of $(pwd):"
+                        ls -la
+                        exit 1
+                      fi
+                      cd "${WORK}"
 
                       echo "=== Terraform Init ==="
                       echo "env:    ${TF_ENV}"
@@ -190,7 +281,19 @@ pipeline:
                     command: |-
                       set -eu
                       export PATH="${TF_BIN_DIR}:${PATH}"
-                      cd "${TF_WORKING_DIR}"
+
+                      # An empty tf_working_dir would make `cd ""` a silent
+                      # no-op, so the failure would surface later as a
+                      # confusing "file not found". Resolve and check it here.
+                      WORK="${TF_WORKING_DIR:-.}"
+                      [ -n "${WORK}" ] || WORK="."
+                      if [ ! -d "${WORK}" ]; then
+                        echo "tf_working_dir '${WORK}' does not exist in the clone."
+                        echo "Contents of $(pwd):"
+                        ls -la
+                        exit 1
+                      fi
+                      cd "${WORK}"
 
                       echo "=== Formatting ==="
                       # -check fails the build instead of rewriting files, so the
@@ -226,13 +329,38 @@ pipeline:
                     command: |-
                       set -eu
                       export PATH="${TF_BIN_DIR}:${PATH}"
-                      cd "${TF_WORKING_DIR}"
+
+                      # An empty tf_working_dir would make `cd ""` a silent
+                      # no-op, so the failure would surface later as a
+                      # confusing "file not found". Resolve and check it here.
+                      WORK="${TF_WORKING_DIR:-.}"
+                      [ -n "${WORK}" ] || WORK="."
+                      if [ ! -d "${WORK}" ]; then
+                        echo "tf_working_dir '${WORK}' does not exist in the clone."
+                        echo "Contents of $(pwd):"
+                        ls -la
+                        exit 1
+                      fi
+                      cd "${WORK}"
 
                       VARFILE="envs/${TF_ENV}.tfvars"
                       if [ ! -f "${VARFILE}" ]; then
                         echo "No such var file: ${VARFILE}"
-                        echo "Available:"
-                        ls -1 envs/
+                        echo "Looking from: $(pwd)"
+                        echo ""
+                        echo "Contents here:"
+                        ls -la
+                        echo ""
+                        if [ -d envs ]; then
+                          echo "envs/ exists and contains:"
+                          ls -1 envs/
+                          echo ""
+                          echo "Set tf_env to one of the names above, without .tfvars"
+                        else
+                          echo "There is no envs/ directory here."
+                          echo "Either tf_working_dir is wrong, or envs/ was never"
+                          echo "pushed. See the Inspect Workspace step above."
+                        fi
                         exit 1
                       fi
 
@@ -372,7 +500,19 @@ pipeline:
                     command: |-
                       set -eu
                       export PATH="${TF_BIN_DIR}:${PATH}"
-                      cd "${TF_WORKING_DIR}"
+
+                      # An empty tf_working_dir would make `cd ""` a silent
+                      # no-op, so the failure would surface later as a
+                      # confusing "file not found". Resolve and check it here.
+                      WORK="${TF_WORKING_DIR:-.}"
+                      [ -n "${WORK}" ] || WORK="."
+                      if [ ! -d "${WORK}" ]; then
+                        echo "tf_working_dir '${WORK}' does not exist in the clone."
+                        echo "Contents of $(pwd):"
+                        ls -la
+                        exit 1
+                      fi
+                      cd "${WORK}"
 
                       set -- \
                         -backend-config="bucket=${STATE_BUCKET}" \
@@ -401,7 +541,19 @@ pipeline:
                     command: |-
                       set -eu
                       export PATH="${TF_BIN_DIR}:${PATH}"
-                      cd "${TF_WORKING_DIR}"
+
+                      # An empty tf_working_dir would make `cd ""` a silent
+                      # no-op, so the failure would surface later as a
+                      # confusing "file not found". Resolve and check it here.
+                      WORK="${TF_WORKING_DIR:-.}"
+                      [ -n "${WORK}" ] || WORK="."
+                      if [ ! -d "${WORK}" ]; then
+                        echo "tf_working_dir '${WORK}' does not exist in the clone."
+                        echo "Contents of $(pwd):"
+                        ls -la
+                        exit 1
+                      fi
+                      cd "${WORK}"
 
                       echo "=== Looking for AWS resources Kubernetes created ==="
 
@@ -485,7 +637,19 @@ pipeline:
                     command: |-
                       set -eu
                       export PATH="${TF_BIN_DIR}:${PATH}"
-                      cd "${TF_WORKING_DIR}"
+
+                      # An empty tf_working_dir would make `cd ""` a silent
+                      # no-op, so the failure would surface later as a
+                      # confusing "file not found". Resolve and check it here.
+                      WORK="${TF_WORKING_DIR:-.}"
+                      [ -n "${WORK}" ] || WORK="."
+                      if [ ! -d "${WORK}" ]; then
+                        echo "tf_working_dir '${WORK}' does not exist in the clone."
+                        echo "Contents of $(pwd):"
+                        ls -la
+                        exit 1
+                      fi
+                      cd "${WORK}"
 
                       VARFILE="envs/${TF_ENV}.tfvars"
 
