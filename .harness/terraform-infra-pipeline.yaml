@@ -1,101 +1,53 @@
-###############################################################################
-# Harness CI pipeline for the EKS Terraform project.
-#
-# Flow:
-#   1. plan      - install pinned tooling, init, validate, plan
-#   2. approval  - manual gate, only for destroy or for the prod environment
-#   3. execute   - re-init, then apply or destroy
-#
-# Plan and execute are separate stages so a human can read the plan before
-# anything is created or deleted. Harness Cloud does not share a workspace
-# between stages, so execute re-runs init. That costs about 30 seconds and is
-# worth it to put a gate in front of billable infrastructure.
-#
-# -----------------------------------------------------------------------------
-# Two implementation details worth knowing before you edit this
-#
-# 1. shell is Sh, so the scripts use `set -eu` and not `set -euo pipefail`.
-#    pipefail is a bashism. Under dash the `set -o pipefail` line fails, and
-#    combined with `set -e` that kills the step before it does anything.
-#
-# 2. Each Run step is its own container. Only /harness (the workspace volume)
-#    survives between steps in a stage. Anything written to /usr/local/bin in
-#    one step is gone in the next. That is why Terraform is installed into
-#    TF_BIN_DIR below and every step puts it back on PATH.
-# -----------------------------------------------------------------------------
-#
-# Required Harness secrets (project or org scope):
-#   aws_access_key_id
-#   aws_secret_access_key
-#
-# Prefer an AWS OIDC connector over static keys if your account allows it.
-# These two secrets are long-lived credentials, the weakest available option.
-###############################################################################
-
 pipeline:
   name: terraform-eks-pipeline
   identifier: terraform_eks_pipeline
   projectIdentifier: HarnessCICDZerotoHero
   orgIdentifier: default
   tags: {}
-
   properties:
     ci:
       codebase:
         connectorRef: account.Github
         repoName: abhibvp003/Harness-CI-CD-Zero-to-Hero
         build: <+input>
-
   variables:
     - name: tf_action
       type: String
-      description: "apply creates or updates the cluster. destroy deletes everything."
+      description: apply creates or updates the cluster. destroy deletes everything.
       value: <+input>.allowedValues(apply,destroy)
-
     - name: tf_env
       type: String
-      description: "Which envs/<name>.tfvars to use. dev is the low-cost learning profile."
+      description: Which envs/<name>.tfvars to use. dev is the low-cost learning profile.
       value: <+input>.allowedValues(dev,prod).default(dev)
-
     - name: tf_working_dir
       type: String
-      description: "Path to the Terraform root inside the repo. Use . if it sits at the top."
-      value: <+input>.default(Episode-03/terraform-project)
-
+      description: Path to the Terraform root inside the repo. Use . if it sits at the top.
+      value: <+input>.default(terraform-harness)
     - name: tf_version
       type: String
-      description: "Pinned Terraform version. Never latest - an unplanned upgrade can rewrite state."
+      description: Pinned Terraform version. Never latest - an unplanned upgrade can rewrite state.
       value: <+input>.default(1.9.8)
-
     - name: aws_region
       type: String
-      description: "Region to deploy into. Must match the region in the tfvars file."
+      description: Region to deploy into. Must match the region in the tfvars file.
       value: <+input>.default(us-east-1)
-
     - name: state_bucket
       type: String
-      description: "S3 bucket holding Terraform state. Must already exist, versioned and encrypted."
+      description: S3 bucket holding Terraform state. Must already exist, versioned and encrypted.
       value: <+input>.default(terraform-statefile-028872334692)
-
     - name: state_key_prefix
       type: String
-      description: "Key prefix in the bucket. The env name is appended so dev and prod never share state."
+      description: Key prefix in the bucket. The env name is appended so dev and prod never share state.
       value: <+input>.default(harness-demo/eks)
-
     - name: state_lock_table
       type: String
-      description: "DynamoDB table for state locking. Set to none to skip (unsafe if two runs overlap)."
+      description: DynamoDB table for state locking. Set to none to skip (unsafe if two runs overlap).
       value: <+input>.default(none)
-
     - name: cluster_admin_role_arn
       type: String
-      description: "IAM role granted cluster-admin via an EKS access entry. none means use the tfvars value."
+      description: IAM role granted cluster-admin via an EKS access entry. none means use the tfvars value.
       value: <+input>.default(none)
-
   stages:
-    # =========================================================================
-    # 1. PLAN
-    # =========================================================================
     - stage:
         name: plan
         identifier: plan
@@ -172,7 +124,6 @@ pipeline:
                       aws sts get-caller-identity --query Arn --output text
 
                       echo "=== Setup done ==="
-
               - step:
                   type: Run
                   name: Terraform Init
@@ -223,7 +174,6 @@ pipeline:
                       terraform init -input=false -no-color "$@"
 
                       echo "=== Init done ==="
-
               - step:
                   type: Run
                   name: Terraform Validate
@@ -257,7 +207,6 @@ pipeline:
                       terraform validate -no-color
 
                       echo "=== Validate done ==="
-
               - step:
                   type: Run
                   name: Terraform Plan
@@ -314,13 +263,6 @@ pipeline:
                       echo "  action: ${TF_ACTION}"
                       echo "  env:    ${TF_ENV}"
                       echo "========================================="
-
-    # =========================================================================
-    # 2. APPROVAL
-    #
-    # Fires only for a destroy, or for anything aimed at prod. A dev apply goes
-    # straight through, since that is the normal learning loop.
-    # =========================================================================
     - stage:
         name: approval
         identifier: approval
@@ -356,10 +298,6 @@ pipeline:
         when:
           pipelineStatus: Success
           condition: <+pipeline.variables.tf_action> == "destroy" || <+pipeline.variables.tf_env> == "prod"
-
-    # =========================================================================
-    # 3. EXECUTE
-    # =========================================================================
     - stage:
         name: execute
         identifier: execute
@@ -413,7 +351,6 @@ pipeline:
 
                       terraform version
                       aws sts get-caller-identity
-
               - step:
                   type: Run
                   name: Terraform Init
@@ -448,7 +385,6 @@ pipeline:
                       fi
 
                       terraform init -input=false -no-color "$@"
-
               - step:
                   type: Run
                   name: Pre Destroy Check
@@ -530,7 +466,6 @@ pipeline:
                   when:
                     stageStatus: Success
                     condition: <+pipeline.variables.tf_action> == "destroy"
-
               - step:
                   type: Run
                   name: Terraform Execute
